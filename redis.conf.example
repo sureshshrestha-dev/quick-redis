@@ -1,0 +1,48 @@
+# Redis Production Configuration Example
+# Use this as reference for your production redis.conf
+
+# ========== MEMORY MANAGEMENT ==========
+# Set a maximum memory limit (e.g., 256MB for development, scale up for prod)
+maxmemory 256mb
+
+# Memory eviction policy - CRITICAL for production!
+# When Redis hits maxmemory, evict the Least Recently Used keys first
+# This keeps your cache "hot" and prevents crashes
+maxmemory-policy allkeys-lru
+
+# Alternative policies:
+# - allkeys-random: Random eviction
+# - allkeys-lfu: Least Frequently Used (better for real-world workloads)
+# - volatile-lru: Only evict keys with expiry time set (if you have both cache + persistent data)
+
+# ========== PERSISTENCE ==========
+# For caching only, disable persistence (faster):
+save ""
+
+# For important data, enable AOF (Append-Only File):
+# appendonly yes
+# appendfsync everysec
+
+# ========== NETWORK ==========
+# Bind to localhost only (important for security!)
+bind 127.0.0.1
+
+# Port
+port 6379
+
+# TCP backlog (connections waiting to be accepted)
+tcp-backlog 511
+
+# ========== LOGGING ==========
+# Log level: debug, verbose, notice, warning
+loglevel notice
+
+# ========== CLIENTS ==========
+# Max number of connected clients
+# Important for preventing connection exhaustion
+maxclients 10000
+
+# ========== MONITORING ==========
+# Enable slowlog to catch performance issues
+slowlog-log-slower-than 10000  # microseconds (10ms)
+slowlog-max-len 128

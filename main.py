@@ -153,3 +153,103 @@ async def check_redis_memory():
         "evicted_keys": memory['evicted_keys'],
         "warning": "Redis is approaching memory limit!" if utilization and utilization > 80 else None
     }
+
+
+# ========== QUEUE HEALTH & MONITORING (PRODUCTION RESILIENCE) ==========
+
+@app.get("/admin/queue-health")
+async def queue_health():
+    """Monitor queue lengths - CRITICAL for production!"""
+    import json
+    
+    pending = await redisclient.redis.llen("email_queue")
+    processing = await redisclient.redis.llen("email_processing")
+    failed = await redisclient.redis.llen("email_failed")
+    
+    # Determine system status based on queue lengths
+    if pending > 5000:
+        status = "critical"
+        health_msg = "Queue is critically backed up! Workers may be down."
+    elif pending > 1000:
+        status = "warning"
+        health_msg = "Queue building up. Consider scaling workers."
+    else:
+        status = "ok"
+        health_msg = "Queues operating normally."
+    
+    return {
+        "status": status,
+        "message": health_msg,
+        "queues": {
+            "pending": pending,
+            "processing": processing,
+            "failed": failed
+        },
+        "alert": "Consider circuit-breaking new requests" if pending > 5000 else None
+    }
+
+
+@app.get("/admin/dead-letter-queue")
+async def inspect_dead_letter_queue(limit: int = 10):
+    """Inspect failed jobs in the Dead Letter Queue"""
+    import json
+    
+    failed_jobs = await redisclient.redis.lrange("email_failed", 0, limit - 1)
+    parsed_jobs = []
+    
+    for job in failed_jobs:
+        try:
+            parsed_jobs.append(json.loads(job))
+        except:
+            parsed_jobs.append({"raw": job})
+    
+    return {
+        "total_failed": await redisclient.redis.llen("email_failed"),
+        "sample": parsed_jobs,
+        "action": "Fix the issue and call /admin/replay-failed-queue to retry"
+    }
+
+
+@app.post("/admin/replay-failed-queue")
+async def replay_failed_queue(limit: int = 10):
+    """Replay failed jobs back to the pending queue"""
+    import json
+    
+    replayed = 0
+    for _ in range(limit):
+        job = await redisclient.redis.rpop("email_failed")
+        if not job:
+            break
+        
+        try:
+            job_data = json.loads(job)
+            user_id = job_data.get("user_id")
+            if user_id:
+                await redisclient.redis.rpush("email_queue", user_id)
+                replayed += 1
+        except:
+            pass
+    
+    return {
+        "replayed": replayed,
+        "message": f"Moved {replayed} jobs back to pending queue"
+    }
+
+
+@app.get("/admin/processing-queue-check")
+async def check_processing_queue():
+    """
+    CRITICAL: Check for stuck jobs in processing queue.
+    If a job stays in processing for too long, the worker likely crashed.
+    """
+    processing = await redisclient.redis.lrange("email_processing", 0, -1)
+    
+    if not processing:
+        return {"status": "ok", "message": "No jobs stuck in processing"}
+    
+    return {
+        "status": "warning",
+        "stuck_jobs": processing,
+        "count": len(processing),
+        "action": "Workers may have crashed. Check logs and restart workers."
+    }
