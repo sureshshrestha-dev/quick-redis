@@ -1,17 +1,80 @@
-from fastapi import FastAPI, HTTPException,Depends
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from bson import ObjectId
+import redis.asyncio as redis
+from schemas import User
+from helper import get_database, get_redis_client
 
-from database import db, redisclient
 app = FastAPI(prefix="/user")
 
-class User(BaseModel):
-    username: str
-    role: str
+
+# Lua script for atomic rate limiting (no race conditions)
+RATE_LIMIT_LUA_SCRIPT = """
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local seconds = tonumber(ARGV[2])
+
+-- Atomically increment and check limit in a single operation
+local current = redis.call("INCR", key)
+
+-- If this is the first increment, set the expiry
+if current == 1 then
+    redis.call("EXPIRE", key, seconds)
+end
+
+-- Return the current count (allows caller to decide if limit exceeded)
+return current
+"""
+
+async def atomic_rate_limiter(
+    user_id: str, 
+    redis_client: RedisClient = Depends(get_redis_client)
+) -> bool:
+    """
+    Production-grade rate limiter using Lua scripting for atomicity.
     
+    Args:
+        user_id: The user identifier for rate limiting
+        redis_client: Injected RedisClient instance
+        
+    Returns:
+        False if request is allowed, True if rate limited
+        
+    Raises:
+        HTTPException(429) if rate limit exceeded
+    """
+    limit = 5
+    seconds = 10
+    key = f"rate_limit:{user_id}"
+    
+    try:
+        # Register the Lua script once (Redis caches by SHA1)
+        lua_script = redis_client.redis.register_script(RATE_LIMIT_LUA_SCRIPT)
+        
+        # Execute atomically: increment + check + set expiry (all in one)
+        current_count = await lua_script(keys=[key], args=[limit, seconds])
+        
+        # If count exceeds limit, reject the request
+        if current_count > limit:
+            raise HTTPException(status_code=429, detail="Too many requests")
+            
+        return False  # Request is allowed
+        
+    except HTTPException:
+        # Re-raise the rate limit exception
+        raise
+    except Exception as e:
+        # Log and fail open (allow request if Redis fails)
+        print(f"⚠️  Rate limiter error: {str(e)}")
+        return False
+    
+
 @app.post("/")
-async def create_user(user: User):
-    check=await db.find_one("users", {"username": user.username})
+async def create_user(
+    user: User,
+    db: Database = Depends(get_database)
+):
+    check = await db.find_one("users", {"username": user.username})
     if check:
         raise HTTPException(status_code=400, detail="Username already exists")
 
@@ -27,9 +90,13 @@ async def create_user(user: User):
 
 
 @app.get("/{user_id}")
-async def read_user(user_id: str):
+async def read_user(
+    user_id: str,
+    db: Database = Depends(get_database),
+    redis_client: RedisClient = Depends(get_redis_client)
+):
     cache_key = f"user:{user_id}"
-    cached_user = await redisclient.get(cache_key)
+    cached_user = await redis_client.get(cache_key)
     if cached_user:
         print("Cache Hit!", cached_user)
         return cached_user
@@ -38,70 +105,66 @@ async def read_user(user_id: str):
     user = await db.find_one("users", {"_id": ObjectId(user_id)}, {"username": 1, "role": 1})
     if user:
         user['_id'] = str(user['_id'])
-        await redisclient.set(cache_key, user, expire=60)
+        await redis_client.set(cache_key, user, expire=60)
         return user
     
     raise HTTPException(status_code=404, detail="User not found")
 
 @app.put("/{user_id}")
-async def update_user(user_id: str, user: User):
-    check=await db.find_one("users", {"_id": ObjectId(user_id)})
+async def update_user(
+    user_id: str,
+    user: User,
+    db: Database = Depends(get_database),
+    redis_client: RedisClient = Depends(get_redis_client)
+):
+    check = await db.find_one("users", {"_id": ObjectId(user_id)})
     if not check:
         raise HTTPException(status_code=404, detail="User not found")
     result = await db.update_one("users", {"_id": ObjectId(user_id)}, user.dict())
     if result:
         cache_key = f"user:{user_id}"
-        await redisclient.delete(cache_key)
+        await redis_client.delete(cache_key)
         print("Cache Updated!", user.dict())
         return "User cleared successfully"
     raise HTTPException(status_code=404, detail="User not found")
 
 @app.delete("/{user_id}")
-async def delete_user(user_id: str):
-    check=await db.find_one("users", {"_id": ObjectId(user_id)})
+async def delete_user(
+    user_id: str,
+    db: Database = Depends(get_database),
+    redis_client: RedisClient = Depends(get_redis_client)
+):
+    check = await db.find_one("users", {"_id": ObjectId(user_id)})
     if not check:
         return "User not found"
     result = await db.delete_one("users", {"_id": ObjectId(user_id)})
     if result:
         cache_key = f"user:{user_id}"
-        await redisclient.redis.delete(cache_key)
+        await redis_client.redis.delete(cache_key)
         return "User deleted successfully"
     raise HTTPException(status_code=404, detail="User not found")
 
-
-async def dummye_rate_limiter(user_id: str):
-    limit = 5
-    seconds = 10
-    key = f"rate_limit:{user_id}"
-    current = await redisclient.redis.get(key)
-    if current and int(current) >= limit:  
-        return True
-    else:
-        pipe = redisclient.redis.pipeline()
-        pipe.incr(key, 1)
-        pipe.expire(key, seconds)
-        await pipe.execute()
-        return False
-    
-
 @app.get("/v2/{user_id}")
-async def read_user(user_id: str ,rate_limit=Depends(dummye_rate_limiter)):
-    # if await dummye_rate_limiter(user_id):
-    #     raise HTTPException(status_code=429, detail="Too many requests")
-    
+async def read_user_v2(
+    user_id: str,
+    db: Database = Depends(get_database),
+    redis_client: RedisClient = Depends(get_redis_client),
+    rate_limit: bool = Depends(lambda u=user_id, r=Depends(get_redis_client): atomic_rate_limiter(u, r))
+):
+    """Read user with atomic rate limiting and real-time view tracking."""
     view_key = f"views:{user_id}"
-    view_count = await redisclient.redis.incr(view_key)
+    view_count = await redis_client.redis.incr(view_key)
     if view_count == 1:
-        await redisclient.redis.expire(view_key, 20)
+        await redis_client.redis.expire(view_key, 20)
 
     cache_key = f"user:{user_id}"
-    cached_user = await redisclient.get(cache_key)
+    cached_user = await redis_client.get(cache_key)
     if cached_user:
-        print(f"Cache Hited Views: {view_count}")
+        print(f"Cache Hit Views: {view_count}")
         cached_user["view_count"] = view_count  # Add real-time view count
         return cached_user
         
-    print(f"Cache Missed Views: {view_count}. querying DB...")
+    print(f"Cache Miss Views: {view_count}. querying DB...")
     user = await db.find_one(
         "users", 
         {"_id": ObjectId(user_id)}, 
@@ -111,35 +174,44 @@ async def read_user(user_id: str ,rate_limit=Depends(dummye_rate_limiter)):
     if user:
         user['_id'] = str(user['_id'])
         user['view_count'] = view_count
-        await redisclient.set(cache_key, user, expire=60)
+        await redis_client.set(cache_key, user, expire=60)
         return user
     
     raise HTTPException(status_code=404, detail="User not found")
 
 
 @app.delete("/cache/{user_id}")
-async def clear_user_cache(user_id: str):
+async def clear_user_cache(
+    user_id: str,
+    redis_client: RedisClient = Depends(get_redis_client)
+):
     pattern = f"user:{user_id}"
-    deleted = await redisclient.delete_by_pattern(pattern)
-    return {"message": f"deleted {deleted} cache pf {user_id}"}
+    deleted = await redis_client.delete_by_pattern(pattern)
+    return {"message": f"deleted {deleted} cache of {user_id}"}
 
 
 @app.delete("/cache-clear")
-async def clear_all_user_cache():
-    deleted = await redisclient.delete_by_pattern("user:*")
+async def clear_all_user_cache(
+    redis_client: RedisClient = Depends(get_redis_client)
+):
+    deleted = await redis_client.delete_by_pattern("user:*")
     return {"message": f"cleared {deleted} user cache"}
 
 
 @app.delete("/rate-limits")
-async def clear_rate_limits():
-    deleted = await redisclient.delete_by_pattern("rate_limit:*")
-    return {"message": f"delete {deleted} rate limit"}
+async def clear_rate_limits(
+    redis_client: RedisClient = Depends(get_redis_client)
+):
+    deleted = await redis_client.delete_by_pattern("rate_limit:*")
+    return {"message": f"deleted {deleted} rate limits"}
 
 
 @app.get("/admin/redis-memory")
-async def check_redis_memory():
+async def check_redis_memory(
+    redis_client: RedisClient = Depends(get_redis_client)
+):
     """Monitor Redis memory usage (alerts if approaching limit)"""
-    memory = await redisclient.get_memory_info()
+    memory = await redis_client.get_memory_info()
     
     # Calculate utilization percentage if maxmemory is set
     utilization = None
@@ -158,13 +230,15 @@ async def check_redis_memory():
 # ========== QUEUE HEALTH & MONITORING (PRODUCTION RESILIENCE) ==========
 
 @app.get("/admin/queue-health")
-async def queue_health():
+async def queue_health(
+    redis_client: RedisClient = Depends(get_redis_client)
+):
     """Monitor queue lengths - CRITICAL for production!"""
     import json
     
-    pending = await redisclient.redis.llen("email_queue")
-    processing = await redisclient.redis.llen("email_processing")
-    failed = await redisclient.redis.llen("email_failed")
+    pending = await redis_client.redis.llen("email_queue")
+    processing = await redis_client.redis.llen("email_processing")
+    failed = await redis_client.redis.llen("email_failed")
     
     # Determine system status based on queue lengths
     if pending > 5000:
@@ -190,11 +264,14 @@ async def queue_health():
 
 
 @app.get("/admin/dead-letter-queue")
-async def inspect_dead_letter_queue(limit: int = 10):
+async def inspect_dead_letter_queue(
+    limit: int = 10,
+    redis_client: RedisClient = Depends(get_redis_client)
+):
     """Inspect failed jobs in the Dead Letter Queue"""
     import json
     
-    failed_jobs = await redisclient.redis.lrange("email_failed", 0, limit - 1)
+    failed_jobs = await redis_client.redis.lrange("email_failed", 0, limit - 1)
     parsed_jobs = []
     
     for job in failed_jobs:
@@ -204,20 +281,23 @@ async def inspect_dead_letter_queue(limit: int = 10):
             parsed_jobs.append({"raw": job})
     
     return {
-        "total_failed": await redisclient.redis.llen("email_failed"),
+        "total_failed": await redis_client.redis.llen("email_failed"),
         "sample": parsed_jobs,
         "action": "Fix the issue and call /admin/replay-failed-queue to retry"
     }
 
 
 @app.post("/admin/replay-failed-queue")
-async def replay_failed_queue(limit: int = 10):
+async def replay_failed_queue(
+    limit: int = 10,
+    redis_client: RedisClient = Depends(get_redis_client)
+):
     """Replay failed jobs back to the pending queue"""
     import json
     
     replayed = 0
     for _ in range(limit):
-        job = await redisclient.redis.rpop("email_failed")
+        job = await redis_client.redis.rpop("email_failed")
         if not job:
             break
         
@@ -225,7 +305,7 @@ async def replay_failed_queue(limit: int = 10):
             job_data = json.loads(job)
             user_id = job_data.get("user_id")
             if user_id:
-                await redisclient.redis.rpush("email_queue", user_id)
+                await redis_client.redis.rpush("email_queue", user_id)
                 replayed += 1
         except:
             pass
@@ -237,12 +317,14 @@ async def replay_failed_queue(limit: int = 10):
 
 
 @app.get("/admin/processing-queue-check")
-async def check_processing_queue():
+async def check_processing_queue(
+    redis_client: RedisClient = Depends(get_redis_client)
+):
     """
     CRITICAL: Check for stuck jobs in processing queue.
     If a job stays in processing for too long, the worker likely crashed.
     """
-    processing = await redisclient.redis.lrange("email_processing", 0, -1)
+    processing = await redis_client.redis.lrange("email_processing", 0, -1)
     
     if not processing:
         return {"status": "ok", "message": "No jobs stuck in processing"}
